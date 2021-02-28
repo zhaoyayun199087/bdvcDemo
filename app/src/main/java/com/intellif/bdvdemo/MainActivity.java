@@ -1,16 +1,27 @@
 package com.intellif.bdvdemo;
 
+import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 import android.Manifest;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
@@ -36,13 +47,18 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends AppCompatActivity implements TextToSpeech.OnInitListener {
     TextView tvText;
     ImageView ivPic;
+    TextToSpeech engine;
     /**
      * 识别控制器，使用MyRecognizer控制识别的流程
      */
@@ -55,6 +71,9 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "bdvcDemoTag ";
     protected Handler handler;
+    Timer timer;
+    TimerTask timerTask;
+
     /*
      * Api的参数类，仅仅用于生成调用START的json字符串，本身与SDK的调用无关
      */
@@ -68,7 +87,10 @@ public class MainActivity extends AppCompatActivity {
         InFileStream.setContext(this);
         setContentView(R.layout.activity_main);
         initPermission();
-
+        initTimer();
+//        initWebSocket();
+        engine = new TextToSpeech(this, this);
+        engine.setOnUtteranceProgressListener(new TtsProgress());
         if( enableOffline ){
             apiParams = new OfflineRecogParams();
         }
@@ -77,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
 
         tvText = findViewById(R.id.et_text);
         ivPic = findViewById(R.id.iv_voice);
+
         ivPic.setOnTouchListener(new View.OnTouchListener() {
             @Override
             public boolean onTouch(View v, MotionEvent event) {
@@ -97,7 +120,7 @@ public class MainActivity extends AppCompatActivity {
                         //松开事件发生后执行代码的区域
                         Log.d(TAG, "iv up");
                         ivPic.setImageResource(R.drawable.ic_keyboard_voice_nomal);
-                        stop();
+//                        stop();
                         break;
                     }
 
@@ -112,6 +135,7 @@ public class MainActivity extends AppCompatActivity {
             /*
              * @param msg
              */
+            @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
             @Override
             public void handleMessage(Message msg) {
                 super.handleMessage(msg);
@@ -156,8 +180,19 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
                 }
+
+
                 if( msg.what == 100 ){
+                    stop();
+                    isPlaying = true;
                     tvText.append("\n" + msg.obj.toString());
+                    engine.speak( msg.obj.toString(), TextToSpeech.QUEUE_FLUSH, null, "utterance");
+                }
+
+                if( msg.arg1 == 2 && msg.what == 2  ){
+                    Log.i(TAG,"识别引擎结束并空闲中");
+                    ivPic.setImageResource(R.drawable.ic_keyboard_voice_pressed);
+                    isStart = false;
                 }
             }
         };
@@ -173,9 +208,88 @@ public class MainActivity extends AppCompatActivity {
             Map<String, Object> offlineParams = OfflineRecogParams.fetchOfflineParams();
             myRecognizer.loadOfflineEngine(offlineParams);
         }
-
+        start();
 
     }
+
+    private void initTimer() {
+        timer = new Timer();
+        timerTask = new TimerTask() {
+            @Override
+            public void run() {
+                Log.i(TAG,"timer get status " + isRecording() + "  " + isPlaying());
+                if(! isRecording() && !isPlaying() ){
+                    Log.i(TAG," timer start record ");
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            start();
+                        }
+                    });
+
+                }
+            }
+        };
+        timer.schedule(timerTask,1000,3000);
+    }
+
+    private void initWebSocket() {
+        OkHttpClient client = new OkHttpClient.Builder()
+                .retryOnConnectionFailure(true)//允许失败重试
+                .readTimeout(5, TimeUnit.SECONDS)//设置读取超时时间
+                .writeTimeout(5, TimeUnit.SECONDS)//设置写的超时时间
+                .connectTimeout(5, TimeUnit.SECONDS)//设置连接超时时间
+                .build();
+        String url = "ws://10.10.2.80:5570";
+
+        Request request  = new Request.Builder().url(url).build();
+
+        WebSocket webSocket = client.newWebSocket(request, new WebSocketListener() {//主要的几个方法(在子线程中回调,刷新UI记得使用Handler)
+            @Override
+            public void onOpen(WebSocket webSocket, Response response) {
+                super.onOpen(webSocket, response);
+                //连接成功
+            }
+
+            @Override
+            public void onMessage(WebSocket webSocket, String text) {
+                super.onMessage(webSocket, text);
+                //接收服务器消息 text
+            }
+
+            @Override
+            public void onMessage(WebSocket webSocket, ByteString bytes) {
+                super.onMessage(webSocket, bytes);
+                //如果服务器传递的是byte类型的
+                String msg = bytes.utf8();
+            }
+
+            @Override
+            public void onFailure(WebSocket webSocket, Throwable t, @Nullable Response response) {
+                super.onFailure(webSocket, t, response);
+                //连接失败调用 异常信息t.getMessage()
+            }
+        });
+
+        client.dispatcher().executorService().shutdown();//内存不足时释放
+        webSocket.send("{\n" +
+                "    \"body\": {\n" +
+                "        \"ctrl\": 1, \n" +
+                "        \"type\": 0, \n" +
+                "        \"loop\": 1,\n" +
+                "        \"content\": {\n" +
+                "            \"text\": \"凡凡真聪明\", \n" +
+                "            \"lang\":0\n" +
+                "        }\n" +
+                "    }, \n" +
+                "    \"cmd\": 41346, \n" +
+                "    \"sn\": 27\n" +
+                "}");
+
+
+
+}
+
     /**
      * android 6.0 以上需要动态申请权限
      */
@@ -222,6 +336,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
+    boolean isStart = false;
+    private boolean isRecording(){
+        return isStart;
+    }
+
     /**
      * 开始录音，点击“开始”按钮后调用。
      * 基于DEMO集成2.1, 2.2 设置识别参数并发送开始事件
@@ -229,8 +348,9 @@ public class MainActivity extends AppCompatActivity {
     protected void start() {
         // DEMO集成步骤2.1 拼接识别参数： 此处params可以打印出来，直接写到你的代码里去，最终的json一致即可。
         final Map<String, Object> params = fetchParams();
+        params.put("vad.endpoint-timeout",0);
         // params 也可以根据文档此处手动修改，参数会以json的格式在界面和logcat日志中打印
-        Log.i(TAG, "设置的start输入参数：" + params);
+        Log.i(TAG, "start record 设置的start输入参数：" + params);
         // 复制此段可以自动检测常规错误
         (new AutoCheck(getApplicationContext(), new Handler() {
             public void handleMessage(Message msg) {
@@ -249,6 +369,8 @@ public class MainActivity extends AppCompatActivity {
         // 这里打印出params， 填写至您自己的app中，直接调用下面这行代码即可。
         // DEMO集成步骤2.2 开始识别
         myRecognizer.start(params);
+        ivPic.setImageResource(R.drawable.ic_keyboard_voice_nomal);
+        isStart = true;
     }
 
     /**
@@ -257,8 +379,10 @@ public class MainActivity extends AppCompatActivity {
      * 基于DEMO集成4.1 发送停止事件 停止录音
      */
     protected void stop() {
-
+        Log.i(TAG, "end record " );
         myRecognizer.stop();
+        ivPic.setImageResource(R.drawable.ic_keyboard_voice_pressed);
+        isStart = false;
     }
 
     /**
@@ -366,5 +490,65 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
+    @Override
+    public void onInit(int i) {
+        if (i == TextToSpeech.SUCCESS) {
+            engine.setLanguage(Locale.CHINA);
+
+        }
+    }
+
+    boolean isPlaying = false;
+    private boolean isPlaying(){
+        return isPlaying;
+    }
+
+    private class TtsProgress extends UtteranceProgressListener {
+
+        @Override
+        public void onStart(String s) {
+            Log.e(TAG, "======onStart: 开始" );
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    //在主界面操作
+                }
+            });
+            isPlaying = true;
+        }
+
+        @Override
+        public void onDone(String s) {
+            Log.e(TAG, "======onDone: 结束" );
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    //在主界面操作
+                }
+            });
+            isPlaying = false;
+        }
+
+        @Override
+        public void onError(String s) {
+            Log.e(TAG, "======onError: 错误" );
+        }
+    }
 
 }
+
+/**
+ 02-26 14:43:35.551 4502-4681/com.intellif.bdvdemo E/bdvcDemoTag: ======onDone: 结束
+ 02-26 14:43:35.551 4502-4502/com.intellif.bdvdemo I/bdvcDemoTag: start record 设置的start输入参数：{decoder=2, vad.endpoint-timeout=0}
+ 02-26 14:43:35.581 4502-4502/com.intellif.bdvdemo D/bdvcDemoTag: handler msg { when=0 what=3 arg1=3 obj=[wp.ready]引擎就绪，可以开始说话。  ;time=1614321815593
+ target=com.intellif.bdvdemo.MainActivity$2 }
+ 02-26 14:43:37.031 4502-4502/com.intellif.bdvdemo D/bdvcDemoTag: handler msg { when=0 what=4 arg1=4 obj=[asr.begin]检测到用户说话  ;time=1614321817039
+ target=com.intellif.bdvdemo.MainActivity$2 }
+ 02-26 14:43:38.721 4502-4502/com.intellif.bdvdemo D/bdvcDemoTag: handler msg { when=0 what=6 arg1=6 obj=[asr.partial]【asr.finish事件】识别错误, 错误码：10 ,10012 ; Offline engine recognize fail[KWS] failed to recognition.
+ target=com.intellif.bdvdemo.MainActivity$2 }
+ 02-26 14:43:38.721 4502-4502/com.intellif.bdvdemo D/bdvcDemoTag: handler msg { when=0 what=6 arg1=6 arg2=1 obj=【asr.finish事件】识别错误, 错误码：10 ,10012 ; Offline engine recognize fail[KWS] failed to recognition.
+ target=com.intellif.bdvdemo.MainActivity$2 }
+ 02-26 14:43:38.731 4502-4502/com.intellif.bdvdemo D/bdvcDemoTag: handler msg { when=-1ms what=2 arg1=2 obj=[asr.exit]识别引擎结束并空闲中  ;time=1614321818736
+ target=com.intellif.bdvdemo.MainActivity$2 }
+
+ **/
